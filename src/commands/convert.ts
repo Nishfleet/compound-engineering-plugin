@@ -2,10 +2,12 @@ import { defineCommand } from "citty"
 import os from "os"
 import path from "path"
 import { loadClaudePlugin } from "../parsers/claude"
-import { targets } from "../targets"
-import type { PermissionMode } from "../converters/claude-to-opencode"
-import { ensureCodexAgentsFile } from "../utils/codex-agents"
-import { expandHome, resolveTargetHome } from "../utils/resolve-home"
+import { targets, validateScope } from "../targets"
+import type { ClaudeToOpenCodeOptions, PermissionMode } from "../converters/claude-to-opencode"
+import { stripCodexAgentsToolMap } from "../utils/codex-agents"
+import { expandHome, resolveCodexHome, resolveTargetHome } from "../utils/resolve-home"
+import { resolveOpenCodeWriteScope, resolveTargetOutputRoot } from "../utils/resolve-output"
+import { detectInstalledTools } from "../utils/detect-tools"
 
 const permissionModes: PermissionMode[] = ["none", "broad", "from-commands"]
 
@@ -23,7 +25,7 @@ export default defineCommand({
     to: {
       type: "string",
       default: "opencode",
-      description: "Target format (opencode | codex | droid | cursor | pi)",
+      description: "Target format (opencode | codex | pi | antigravity | all)",
     },
     output: {
       type: "string",
@@ -33,12 +35,16 @@ export default defineCommand({
     codexHome: {
       type: "string",
       alias: "codex-home",
-      description: "Write Codex output to this .codex root (ex: ~/.codex)",
+      description: "Write Codex output to this Codex root (default: $CODEX_HOME or ~/.codex)",
     },
     piHome: {
       type: "string",
       alias: "pi-home",
       description: "Write Pi output to this Pi root (ex: ~/.pi/agent or ./.pi)",
+    },
+    scope: {
+      type: "string",
+      description: "Scope level: global | workspace (default varies by target)",
     },
     also: {
       type: "string",
@@ -59,9 +65,83 @@ export default defineCommand({
       default: true,
       description: "Infer agent temperature from name/description",
     },
+    includeSkills: {
+      type: "boolean",
+      default: false,
+      alias: "include-skills",
+      description: "For --to codex only: also emit skills and commands. Default is agents-only, the recommended pairing with `codex plugin install`. Set this flag for a legacy / standalone install without Codex native plugin install. Ignored by other targets.",
+    },
   },
   async run({ args }) {
     const targetName = String(args.to)
+
+    const permissions = String(args.permissions)
+    if (!permissionModes.includes(permissions as PermissionMode)) {
+      throw new Error(`Unknown permissions mode: ${permissions}`)
+    }
+
+    const plugin = await loadClaudePlugin(String(args.source))
+    const outputRoot = resolveOutputRoot(args.output)
+    const hasExplicitOutput = Boolean(args.output && String(args.output).trim())
+    const codexHome = resolveCodexHome(args.codexHome)
+    const piHome = resolveTargetHome(args.piHome, path.join(os.homedir(), ".pi", "agent"))
+
+    const options: ClaudeToOpenCodeOptions = {
+      agentMode: String(args.agentMode) === "primary" ? "primary" : "subagent",
+      inferTemperature: Boolean(args.inferTemperature),
+      permissions: permissions as PermissionMode,
+      codexIncludeSkills: Boolean(args.includeSkills),
+    }
+
+    if (targetName === "all") {
+      const detected = await detectInstalledTools()
+      const activeTargets = detected.filter((t) => t.detected && targets[t.name]?.implemented)
+
+      if (activeTargets.length === 0) {
+        console.log("No installable AI coding tools detected. Use native plugin install for Claude Code, Copilot, Droid, oh-my-pi (omp), OpenCode, Pi, and Qwen.")
+        return
+      }
+
+      console.log(`Detected ${activeTargets.length} installable tool(s):`)
+      for (const tool of detected) {
+        if (tool.detected && !targets[tool.name]?.implemented) {
+          console.log(`  - ${tool.name} — native plugin install; skipped`)
+          continue
+        }
+        console.log(`  ${tool.detected ? "✓" : "✗"} ${tool.name} — ${tool.reason}`)
+      }
+
+      for (const tool of activeTargets) {
+        const handler = targets[tool.name]
+        if (!handler || !handler.implemented) {
+          console.warn(`Skipping ${tool.name}: not implemented.`)
+          continue
+        }
+        const bundle = handler.convert(plugin, options)
+        if (!bundle) {
+          console.warn(`Skipping ${tool.name}: no output returned.`)
+          continue
+        }
+        const root = resolveTargetOutputRoot({
+          targetName: tool.name,
+          outputRoot,
+          codexHome,
+          piHome,
+          pluginName: plugin.manifest.name,
+          hasExplicitOutput,
+        })
+        const writeScope =
+          tool.name === "opencode" ? resolveOpenCodeWriteScope(hasExplicitOutput, undefined) : undefined
+        await handler.write(root, bundle, writeScope)
+        console.log(`Converted ${plugin.manifest.name} to ${tool.name} at ${root}`)
+      }
+
+      if (activeTargets.some((t) => t.name === "codex")) {
+        await stripCodexAgentsToolMap(codexHome)
+      }
+      return
+    }
+
     const target = targets[targetName]
     if (!target) {
       throw new Error(`Unknown target: ${targetName}`)
@@ -71,29 +151,25 @@ export default defineCommand({
       throw new Error(`Target ${targetName} is registered but not implemented yet.`)
     }
 
-    const permissions = String(args.permissions)
-    if (!permissionModes.includes(permissions as PermissionMode)) {
-      throw new Error(`Unknown permissions mode: ${permissions}`)
-    }
+    const resolvedScope = validateScope(targetName, target, args.scope ? String(args.scope) : undefined)
 
-    const plugin = await loadClaudePlugin(String(args.source))
-    const outputRoot = resolveOutputRoot(args.output)
-    const codexHome = resolveTargetHome(args.codexHome, path.join(os.homedir(), ".codex"))
-    const piHome = resolveTargetHome(args.piHome, path.join(os.homedir(), ".pi", "agent"))
-
-    const options = {
-      agentMode: String(args.agentMode) === "primary" ? "primary" : "subagent",
-      inferTemperature: Boolean(args.inferTemperature),
-      permissions: permissions as PermissionMode,
-    }
-
-    const primaryOutputRoot = resolveTargetOutputRoot(targetName, outputRoot, codexHome, piHome)
+    const primaryOutputRoot = resolveTargetOutputRoot({
+      targetName,
+      outputRoot,
+      codexHome,
+      piHome,
+      pluginName: plugin.manifest.name,
+      hasExplicitOutput,
+      scope: resolvedScope,
+    })
     const bundle = target.convert(plugin, options)
     if (!bundle) {
       throw new Error(`Target ${targetName} did not return a bundle.`)
     }
 
-    await target.write(primaryOutputRoot, bundle)
+    const effectiveScope =
+      targetName === "opencode" ? resolveOpenCodeWriteScope(hasExplicitOutput, resolvedScope) : resolvedScope
+    await target.write(primaryOutputRoot, bundle, effectiveScope)
     console.log(`Converted ${plugin.manifest.name} to ${targetName} at ${primaryOutputRoot}`)
 
     const extraTargets = parseExtraTargets(args.also)
@@ -113,13 +189,25 @@ export default defineCommand({
         console.warn(`Skipping ${extra}: no output returned.`)
         continue
       }
-      const extraRoot = resolveTargetOutputRoot(extra, path.join(outputRoot, extra), codexHome, piHome)
-      await handler.write(extraRoot, extraBundle)
+      const extraRoot = resolveTargetOutputRoot({
+        targetName: extra,
+        outputRoot,
+        codexHome,
+        piHome,
+        pluginName: plugin.manifest.name,
+        hasExplicitOutput,
+        scope: handler.defaultScope,
+      })
+      const extraScope =
+        extra === "opencode"
+          ? resolveOpenCodeWriteScope(hasExplicitOutput, handler.defaultScope)
+          : handler.defaultScope
+      await handler.write(extraRoot, extraBundle, extraScope)
       console.log(`Converted ${plugin.manifest.name} to ${extra} at ${extraRoot}`)
     }
 
     if (allTargets.includes("codex")) {
-      await ensureCodexAgentsFile(codexHome)
+      await stripCodexAgentsToolMap(codexHome)
     }
   },
 })
@@ -138,12 +226,4 @@ function resolveOutputRoot(value: unknown): string {
     return path.resolve(expanded)
   }
   return process.cwd()
-}
-
-function resolveTargetOutputRoot(targetName: string, outputRoot: string, codexHome: string, piHome: string): string {
-  if (targetName === "codex") return codexHome
-  if (targetName === "pi") return piHome
-  if (targetName === "droid") return path.join(os.homedir(), ".factory")
-  if (targetName === "cursor") return path.join(outputRoot, ".cursor")
-  return outputRoot
 }

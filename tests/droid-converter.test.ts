@@ -77,6 +77,77 @@ describe("convertClaudeToDroid", () => {
     expect(parsed.body).toContain("Focus on vulnerabilities.")
   })
 
+  test("does not infer tools from incidental substrings in agent prose", () => {
+    const plugin: ClaudePlugin = {
+      ...fixturePlugin,
+      agents: [
+        {
+          name: "strategist",
+          description: "plans work",
+          body: "Review the request using already gathered context then do tasks as a checklist with details. Never open an editor and think globally about tradeoffs.",
+          sourcePath: "/tmp/plugin/agents/strategist.md",
+        },
+      ],
+      commands: [],
+      skills: [],
+    }
+
+    const bundle = convertClaudeToDroid(plugin, {
+      agentMode: "subagent",
+      inferTemperature: false,
+      permissions: "none",
+    })
+
+    const parsed = parseFrontmatter(bundle.droids[0].content)
+    expect(parsed.data.tools).toBeUndefined()
+  })
+
+  test("still infers tools from whole-word references", () => {
+    const plugin: ClaudePlugin = {
+      ...fixturePlugin,
+      agents: [
+        {
+          name: "worker",
+          description: "does work",
+          body: "Use Read to inspect files and Bash to run commands.",
+          sourcePath: "/tmp/plugin/agents/worker.md",
+        },
+      ],
+      commands: [],
+      skills: [],
+    }
+
+    const bundle = convertClaudeToDroid(plugin, {
+      agentMode: "subagent",
+      inferTemperature: false,
+      permissions: "none",
+    })
+
+    const parsed = parseFrontmatter(bundle.droids[0].content)
+    expect(parsed.data.tools).toEqual(["Execute", "Read"])
+  })
+
+  test("maps AskUserQuestion by its real tool name, not the bare word", () => {
+    // \bquestion\b never matches inside the CamelCase AskUserQuestion, so key on the full name.
+    const usesTool: ClaudePlugin = {
+      ...fixturePlugin,
+      agents: [{ name: "asker", description: "asks things", body: "Use AskUserQuestion after Read to gather files.", sourcePath: "/tmp/plugin/agents/asker.md" }],
+      commands: [],
+      skills: [],
+    }
+    const withTool = convertClaudeToDroid(usesTool, { agentMode: "subagent", inferTemperature: false, permissions: "none" })
+    expect(parseFrontmatter(withTool.droids[0].content).data.tools).toEqual(["AskUser", "Read"])
+
+    const prose: ClaudePlugin = {
+      ...fixturePlugin,
+      agents: [{ name: "asker", description: "asks things", body: "Answer the user's question after Read.", sourcePath: "/tmp/plugin/agents/asker.md" }],
+      commands: [],
+      skills: [],
+    }
+    const bareWord = convertClaudeToDroid(prose, { agentMode: "subagent", inferTemperature: false, permissions: "none" })
+    expect(parseFrontmatter(bareWord.droids[0].content).data.tools).toEqual(["Read"])
+  })
+
   test("passes through skill directories", () => {
     const bundle = convertClaudeToDroid(fixturePlugin, {
       agentMode: "subagent",
@@ -89,7 +160,31 @@ describe("convertClaudeToDroid", () => {
     expect(bundle.skillDirs[0].sourceDir).toBe("/tmp/plugin/skills/existing-skill")
   })
 
-  test("sets model to inherit when not specified", () => {
+  test("passes through model as-is (Factory resolves bare aliases natively)", () => {
+    const plugin: ClaudePlugin = {
+      ...fixturePlugin,
+      agents: [
+        {
+          name: "fast-agent",
+          description: "Fast agent",
+          model: "sonnet",
+          body: "Do things quickly.",
+          sourcePath: "/tmp/plugin/agents/fast.md",
+        },
+      ],
+    }
+
+    const bundle = convertClaudeToDroid(plugin, {
+      agentMode: "subagent",
+      inferTemperature: false,
+      permissions: "none",
+    })
+
+    const parsed = parseFrontmatter(bundle.droids[0].content)
+    expect(parsed.data.model).toBe("sonnet")
+  })
+
+  test("omits model when set to inherit", () => {
     const plugin: ClaudePlugin = {
       ...fixturePlugin,
       agents: [
@@ -110,7 +205,7 @@ describe("convertClaudeToDroid", () => {
     })
 
     const parsed = parseFrontmatter(bundle.droids[0].content)
-    expect(parsed.data.model).toBe("inherit")
+    expect(parsed.data.model).toBeUndefined()
   })
 
   test("transforms Task agent calls to droid-compatible syntax", () => {
@@ -148,6 +243,63 @@ Task best-practices-researcher(topic)`,
     expect(parsed.body).not.toContain("Task repo-research-analyst(")
   })
 
+  test("transforms namespaced Task agent calls using final segment", () => {
+    const plugin: ClaudePlugin = {
+      ...fixturePlugin,
+      commands: [
+        {
+          name: "plan",
+          description: "Planning with namespaced agents",
+          body: `Run agents:
+
+- Task compound-engineering:research:repo-research-analyst(feature_description)
+- Task compound-engineering:review:security-reviewer(code_diff)`,
+          sourcePath: "/tmp/plugin/commands/plan.md",
+        },
+      ],
+      agents: [],
+      skills: [],
+    }
+
+    const bundle = convertClaudeToDroid(plugin, {
+      agentMode: "subagent",
+      inferTemperature: false,
+      permissions: "none",
+    })
+
+    const parsed = parseFrontmatter(bundle.commands[0].content)
+    expect(parsed.body).toContain("Task repo-research-analyst: feature_description")
+    expect(parsed.body).toContain("Task security-reviewer: code_diff")
+    expect(parsed.body).not.toContain("compound-engineering:")
+  })
+
+  test("transforms zero-argument Task calls", () => {
+    const plugin: ClaudePlugin = {
+      ...fixturePlugin,
+      commands: [
+        {
+          name: "review",
+          description: "Review code",
+          body: `- Task compound-engineering:review:code-simplicity-reviewer()`,
+          sourcePath: "/tmp/plugin/commands/review.md",
+        },
+      ],
+      agents: [],
+      skills: [],
+    }
+
+    const bundle = convertClaudeToDroid(plugin, {
+      agentMode: "subagent",
+      inferTemperature: false,
+      permissions: "none",
+    })
+
+    const parsed = parseFrontmatter(bundle.commands[0].content)
+    expect(parsed.body).toContain("Task code-simplicity-reviewer")
+    expect(parsed.body).not.toContain("compound-engineering:")
+    expect(parsed.body).not.toContain("()")
+  })
+
   test("transforms slash commands by flattening namespaces", () => {
     const plugin: ClaudePlugin = {
       ...fixturePlugin,
@@ -157,7 +309,7 @@ Task best-practices-researcher(topic)`,
           description: "Planning with commands",
           body: `After planning, you can:
 
-1. Run /deepen-plan to enhance
+1. Run /todo-resolve to enhance
 2. Run /plan_review for feedback
 3. Start /workflows:work to implement
 
@@ -176,7 +328,7 @@ Don't confuse with file paths like /tmp/output.md or /dev/null.`,
     })
 
     const parsed = parseFrontmatter(bundle.commands[0].content)
-    expect(parsed.body).toContain("/deepen-plan")
+    expect(parsed.body).toContain("/todo-resolve")
     expect(parsed.body).toContain("/plan_review")
     expect(parsed.body).toContain("/work")
     expect(parsed.body).not.toContain("/workflows:work")

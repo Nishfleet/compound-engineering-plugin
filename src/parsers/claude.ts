@@ -60,8 +60,8 @@ async function loadAgents(agentsDirs: string[]): Promise<ClaudeAgent[]> {
   const agents: ClaudeAgent[] = []
   for (const file of files) {
     const raw = await readText(file)
-    const { data, body } = parseFrontmatter(raw)
-    const name = (data.name as string) ?? path.basename(file, ".md")
+    const { data, body } = parseFrontmatter(raw, file)
+    const name = (data.name as string) ?? deriveMarkdownStem(file)
     agents.push({
       name,
       description: data.description as string | undefined,
@@ -80,7 +80,7 @@ async function loadCommands(commandsDirs: string[]): Promise<ClaudeCommand[]> {
   const commands: ClaudeCommand[] = []
   for (const file of files) {
     const raw = await readText(file)
-    const { data, body } = parseFrontmatter(raw)
+    const { data, body } = parseFrontmatter(raw, file)
     const name = (data.name as string) ?? path.basename(file, ".md")
     const allowedTools = parseAllowedTools(data["allowed-tools"])
     const disableModelInvocation = data["disable-model-invocation"] === true ? true : undefined
@@ -104,13 +104,18 @@ async function loadSkills(skillsDirs: string[]): Promise<ClaudeSkill[]> {
   const skills: ClaudeSkill[] = []
   for (const file of skillFiles) {
     const raw = await readText(file)
-    const { data } = parseFrontmatter(raw)
+    const { data } = parseFrontmatter(raw, file)
     const name = (data.name as string) ?? path.basename(path.dirname(file))
     const disableModelInvocation = data["disable-model-invocation"] === true ? true : undefined
+    const userInvocable = data["user-invocable"] === false ? false : undefined
+    const ce_platforms = Array.isArray(data.ce_platforms) ? (data.ce_platforms as string[]) : undefined
     skills.push({
       name,
       description: data.description as string | undefined,
+      argumentHint: data["argument-hint"] as string | undefined,
       disableModelInvocation,
+      userInvocable,
+      ce_platforms,
       sourceDir: path.dirname(file),
       skillPath: file,
     })
@@ -158,7 +163,8 @@ async function loadMcpServers(
 
   const mcpPath = path.join(root, ".mcp.json")
   if (await pathExists(mcpPath)) {
-    return readJson<Record<string, ClaudeMcpServer>>(mcpPath)
+    const raw = await readJson<Record<string, unknown>>(mcpPath)
+    return unwrapMcpServers(raw)
   }
 
   return undefined
@@ -201,6 +207,10 @@ async function collectMarkdownFiles(dirs: string[]): Promise<string[]> {
   return entries.filter((file) => file.endsWith(".md"))
 }
 
+function deriveMarkdownStem(filePath: string): string {
+  return path.basename(filePath, ".md").replace(/\.agent$/, "")
+}
+
 async function collectFiles(dirs: string[]): Promise<string[]> {
   const files: string[] = []
   for (const dir of dirs) {
@@ -232,10 +242,18 @@ async function loadMcpPaths(
   for (const entry of toPathList(value)) {
     const resolved = resolveWithinRoot(root, entry, "mcpServers path")
     if (await pathExists(resolved)) {
-      configs.push(await readJson<Record<string, ClaudeMcpServer>>(resolved))
+      const raw = await readJson<Record<string, unknown>>(resolved)
+      configs.push(unwrapMcpServers(raw))
     }
   }
   return configs
+}
+
+function unwrapMcpServers(raw: Record<string, unknown>): Record<string, ClaudeMcpServer> {
+  if (raw.mcpServers && typeof raw.mcpServers === "object") {
+    return raw.mcpServers as Record<string, ClaudeMcpServer>
+  }
+  return raw as Record<string, ClaudeMcpServer>
 }
 
 function mergeMcpConfigs(configs: Record<string, ClaudeMcpServer>[]): Record<string, ClaudeMcpServer> {

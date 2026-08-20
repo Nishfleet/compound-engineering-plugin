@@ -5,7 +5,7 @@ export type FrontmatterResult = {
   body: string
 }
 
-export function parseFrontmatter(raw: string): FrontmatterResult {
+export function parseFrontmatter(raw: string, sourcePath?: string): FrontmatterResult {
   const lines = raw.split(/\r?\n/)
   if (lines.length === 0 || lines[0].trim() !== "---") {
     return { data: {}, body: raw }
@@ -25,9 +25,15 @@ export function parseFrontmatter(raw: string): FrontmatterResult {
 
   const yamlText = lines.slice(1, endIndex).join("\n")
   const body = lines.slice(endIndex + 1).join("\n")
-  const parsed = load(yamlText)
-  const data = (parsed && typeof parsed === "object") ? (parsed as Record<string, unknown>) : {}
-  return { data, body }
+  try {
+    const parsed = load(yamlText)
+    const data = (parsed && typeof parsed === "object") ? (parsed as Record<string, unknown>) : {}
+    return { data, body }
+  } catch (err) {
+    const location = sourcePath ? ` in ${sourcePath}` : ""
+    const hint = "Tip: quote frontmatter values containing colons (e.g. description: 'Use for X: Y')"
+    throw new Error(`Invalid YAML frontmatter${location}: ${err instanceof Error ? err.message : err}\n${hint}`)
+  }
 }
 
 export function formatFrontmatter(data: Record<string, unknown>, body: string): string {
@@ -58,8 +64,20 @@ function formatYamlValue(value: unknown): string {
   if (raw.includes("\n")) {
     return `|\n${raw.split("\n").map((line) => `  ${line}`).join("\n")}`
   }
-  if (raw.includes(":") || raw.startsWith("[") || raw.startsWith("{")) {
+  if (raw.includes(":") || raw.startsWith("[") || raw.startsWith("{") || raw === "*" || parsesAsNonString(raw)) {
     return JSON.stringify(raw)
   }
   return raw
+}
+
+// A bare string that YAML reads back as a non-string (null, bool, number, date)
+// silently changes type on round-trip. Quote it. Re-parsing with the same loader
+// the read path uses keeps this rule in lockstep with js-yaml rather than a
+// hand-maintained token list that can drift from the parser's actual grammar.
+function parsesAsNonString(raw: string): boolean {
+  try {
+    return typeof load(raw) !== "string"
+  } catch {
+    return false
+  }
 }

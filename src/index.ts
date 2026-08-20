@@ -1,21 +1,24 @@
 #!/usr/bin/env bun
 import { defineCommand, runMain } from "citty"
+import packageJson from "../package.json"
 import convert from "./commands/convert"
+import cleanup from "./commands/cleanup"
 import install from "./commands/install"
 import listCommand from "./commands/list"
-import sync from "./commands/sync"
+import pluginPath from "./commands/plugin-path"
 
 const main = defineCommand({
   meta: {
     name: "compound-plugin",
-    version: "0.1.0",
+    version: packageJson.version,
     description: "Convert Claude Code plugins into other agent formats",
   },
   subCommands: {
+    cleanup: () => cleanup,
     convert: () => convert,
     install: () => install,
     list: () => listCommand,
-    sync: () => sync,
+    "plugin-path": () => pluginPath,
   },
 })
 

@@ -1,7 +1,8 @@
 import { formatFrontmatter } from "../utils/frontmatter"
-import type { ClaudeAgent, ClaudeCommand, ClaudePlugin } from "../types/claude"
+import { type ClaudeAgent, type ClaudeCommand, type ClaudePlugin, filterSkillsByPlatform } from "../types/claude"
 import type { DroidBundle, DroidCommandFile, DroidAgentFile } from "../types/droid"
 import type { ClaudeToOpenCodeOptions } from "./claude-to-opencode"
+import { transformSlashCommands } from "../utils/slash-command"
 
 export type ClaudeToDroidOptions = ClaudeToOpenCodeOptions
 
@@ -20,7 +21,7 @@ const CLAUDE_TO_DROID_TOOLS: Record<string, string> = {
   task: "Task",
   todowrite: "TodoWrite",
   todoread: "TodoWrite",
-  question: "AskUser",
+  askuserquestion: "AskUser",
 }
 
 const VALID_DROID_TOOLS = new Set([
@@ -45,12 +46,12 @@ export function convertClaudeToDroid(
 ): DroidBundle {
   const commands = plugin.commands.map((command) => convertCommand(command))
   const droids = plugin.agents.map((agent) => convertAgent(agent))
-  const skillDirs = plugin.skills.map((skill) => ({
+  const skillDirs = filterSkillsByPlatform(plugin.skills, "droid").map((skill) => ({
     name: skill.name,
     sourceDir: skill.sourceDir,
   }))
 
-  return { commands, droids, skillDirs }
+  return { pluginName: plugin.manifest.name, commands, droids, skillDirs }
 }
 
 function convertCommand(command: ClaudeCommand): DroidCommandFile {
@@ -75,7 +76,10 @@ function convertAgent(agent: ClaudeAgent): DroidAgentFile {
   const frontmatter: Record<string, unknown> = {
     name,
     description: agent.description,
-    model: agent.model && agent.model !== "inherit" ? agent.model : "inherit",
+  }
+
+  if (agent.model && agent.model !== "inherit") {
+    frontmatter.model = agent.model
   }
 
   const tools = mapAgentTools(agent)
@@ -103,7 +107,7 @@ function mapAgentTools(agent: ClaudeAgent): string[] | undefined {
 
   const mentionedTools = new Set<string>()
   for (const [claudeTool, droidTool] of Object.entries(CLAUDE_TO_DROID_TOOLS)) {
-    if (bodyLower.includes(claudeTool)) {
+    if (new RegExp(`\\b${claudeTool}\\b`).test(bodyLower)) {
       mentionedTools.add(droidTool)
     }
   }
@@ -119,26 +123,24 @@ function mapAgentTools(agent: ClaudeAgent): string[] | undefined {
  * 2. Task agent calls: Task agent-name(args) → Task agent-name: args
  * 3. Agent references: @agent-name → the agent-name droid
  */
-function transformContentForDroid(body: string): string {
+export function transformContentForDroid(body: string): string {
   let result = body
 
   // 1. Transform Task agent calls
-  // Match: Task repo-research-analyst(feature_description)
-  const taskPattern = /^(\s*-?\s*)Task\s+([a-z][a-z0-9-]*)\(([^)]+)\)/gm
+  // Match: Task repo-research-analyst(args) or Task compound-engineering:research:repo-research-analyst(args)
+  const taskPattern = /^(\s*-?\s*)Task\s+([a-z][a-z0-9:-]*)\(([^)]*)\)/gm
   result = result.replace(taskPattern, (_match, prefix: string, agentName: string, args: string) => {
-    const name = normalizeName(agentName)
-    return `${prefix}Task ${name}: ${args.trim()}`
+    const finalSegment = agentName.includes(":") ? agentName.split(":").pop()! : agentName
+    const name = normalizeName(finalSegment)
+    const trimmedArgs = args.trim()
+    return trimmedArgs
+      ? `${prefix}Task ${name}: ${trimmedArgs}`
+      : `${prefix}Task ${name}`
   })
 
   // 2. Transform slash command references
   // /workflows:plan → /plan, /command-name stays as-is
-  const slashCommandPattern = /(?<![:\w])\/([a-z][a-z0-9_:-]*?)(?=[\s,."')\]}`]|$)/gi
-  result = result.replace(slashCommandPattern, (match, commandName: string) => {
-    if (commandName.includes('/')) return match
-    if (['dev', 'tmp', 'etc', 'usr', 'var', 'bin', 'home'].includes(commandName)) return match
-    const flattened = flattenCommandName(commandName)
-    return `/${flattened}`
-  })
+  result = transformSlashCommands(result, (commandName) => `/${flattenCommandName(commandName)}`)
 
   // 3. Transform @agent-name references to droid references
   const agentRefPattern = /@agent-([a-z][a-z0-9-]*)/gi
